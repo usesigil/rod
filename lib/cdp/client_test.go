@@ -3,6 +3,7 @@ package cdp_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -241,34 +242,134 @@ func TestSlowSend(t *testing.T) {
 	g.E(err)
 }
 
+func TestCallPreCancelledCtxNoSocketTouch(t *testing.T) {
+	g := setup(t)
+
+	gotrace.CheckLeak(g, 0)
+
+	// Pre-cancelled ctx must return ctx.Err() without calling Send or Close
+	// on the underlying socket. Otherwise a stale queued job would kill a
+	// healthy CDP connection.
+	release := make(chan struct{})
+	sendCalls := 0
+	closeCalls := 0
+
+	ws := &MockWebSocket{
+		send: func([]byte) error {
+			sendCalls++
+			return nil
+		},
+		read: func() ([]byte, error) {
+			<-release
+			return nil, io.EOF
+		},
+		close: func() error {
+			closeCalls++
+			return nil
+		},
+	}
+
+	c := cdp.New().Start(ws)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := c.Call(ctx, "sid", "method", 1)
+	g.True(errors.Is(err, context.Canceled))
+	g.Eq(sendCalls, 0)
+	g.Eq(closeCalls, 0)
+
+	close(release)
+}
+
+func TestCallNoCloseOnResponseWaitTimeout(t *testing.T) {
+	g := setup(t)
+
+	gotrace.CheckLeak(g, 0)
+
+	// Send completes instantly (healthy). Response never arrives, so the
+	// wait-phase select must time out on ctx without closing the conn.
+	blockRead := make(chan struct{})
+	closeCalls := 0
+
+	ws := &MockWebSocket{
+		send: func([]byte) error {
+			return nil
+		},
+		read: func() ([]byte, error) {
+			<-blockRead
+			return nil, io.EOF
+		},
+		close: func() error {
+			closeCalls++
+			return nil
+		},
+	}
+
+	c := cdp.New().Start(ws)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := c.Call(ctx, "sid", "method", 1)
+	g.True(errors.Is(err, context.DeadlineExceeded))
+	g.Eq(closeCalls, 0)
+
+	// Unblock consumeMessages so the goroutine exits for the leak check.
+	close(blockRead)
+}
+
+func TestCallCloseOnSendBlockCtxTimeout(t *testing.T) {
+	g := setup(t)
+
+	gotrace.CheckLeak(g, 0)
+
+	unblock := make(chan struct{})
+	closeCalls := 0
+
+	ws := &MockWebSocket{
+		send: func([]byte) error {
+			<-unblock
+			return io.EOF
+		},
+		read: func() ([]byte, error) {
+			<-unblock
+			return nil, io.EOF
+		},
+		close: func() error {
+			closeCalls++
+			close(unblock)
+			return nil
+		},
+	}
+
+	c := cdp.New().Start(ws)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := c.Call(ctx, "sid", "method", 1)
+	g.True(errors.Is(err, context.DeadlineExceeded))
+	g.Eq(closeCalls, 1)
+}
+
 func TestCancelCallLeak(t *testing.T) {
 	g := setup(t)
 
 	gotrace.CheckLeak(g, 0)
 
+	// With the pre-cancelled ctx fast path, Call returns before Send runs,
+	// so the mock's Read just needs a way to exit cleanly for consumeMessages.
 	for i := 0; i < 30; i++ {
-		id := 0
-		wait := make(chan int)
+		release := make(chan struct{})
 
 		ws := &MockWebSocket{
 			send: func([]byte) error {
-				close(wait)
-				utils.Sleep(0.01)
 				return nil
 			},
 			read: func() ([]byte, error) {
-				if id > 0 {
-					return nil, io.EOF
-				}
-
-				id++
-				<-wait
-
-				return json.Marshal(cdp.Response{
-					ID:     id,
-					Result: json.RawMessage("1"),
-					Error:  nil,
-				})
+				<-release
+				return nil, io.EOF
+			},
+			close: func() error {
+				return nil
 			},
 		}
 
@@ -276,6 +377,8 @@ func TestCancelCallLeak(t *testing.T) {
 		ctx := g.Context()
 		ctx.Cancel()
 		_, _ = c.Call(ctx, "1234567890", "method", 1)
+
+		close(release)
 	}
 }
 
@@ -344,8 +447,9 @@ func TestMassBrowserClose(t *testing.T) { //nolint: tparallel
 }
 
 type MockWebSocket struct {
-	send func(data []byte) error
-	read func() ([]byte, error)
+	send  func(data []byte) error
+	read  func() ([]byte, error)
+	close func() error
 }
 
 func (c *MockWebSocket) Send(data []byte) error {
@@ -354,4 +458,11 @@ func (c *MockWebSocket) Send(data []byte) error {
 
 func (c *MockWebSocket) Read() ([]byte, error) {
 	return c.read()
+}
+
+func (c *MockWebSocket) Close() error {
+	if c.close == nil {
+		return nil
+	}
+	return c.close()
 }

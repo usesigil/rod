@@ -47,3 +47,8 @@ func (w *WebSocket) Send(b []byte) error {
 func (w *WebSocket) Read() ([]byte, error) {
 	return wsutil.ReadServerText(w.conn)
 }
+
+// Close ...
+func (w *WebSocket) Close() error {
+	return w.conn.Close()
+}

@@ -40,6 +40,9 @@ type WebSocketable interface {
 	Send(data []byte) error
 	// Read returns text message only
 	Read() ([]byte, error)
+	// Close the connection. Called to unblock an in-flight Send when the
+	// caller's context is cancelled while the Send is still running.
+	Close() error
 }
 
 // Client is a devtools protocol connection instance.
@@ -85,6 +88,14 @@ type result struct {
 
 // Call a method and wait for its response.
 func (cdp *Client) Call(ctx context.Context, sessionID, method string, params interface{}) ([]byte, error) {
+	// Fast path for stale/cancelled callers: don't allocate a request, don't
+	// register pending state, don't touch the socket. This matters in queue/
+	// worker designs where jobs can become stale before they reach Call, and
+	// ensures a cancelled parent never closes a healthy CDP connection.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	req := &Request{
 		ID:        int(atomic.AddUint64(&cdp.count, 1)),
 		SessionID: sessionID,
@@ -109,9 +120,26 @@ func (cdp *Client) Call(ctx context.Context, sessionID, method string, params in
 	})
 	defer cdp.pending.Delete(req.ID)
 
-	err = cdp.ws.Send(data)
-	if err != nil {
-		return nil, err
+	// Run Send in a goroutine so a stuck ws.Write doesn't prevent us from
+	// honoring ctx cancellation. Buffered so the goroutine can always exit
+	// even if Call already returned.
+	sendErr := make(chan error, 1)
+	go func() {
+		sendErr <- cdp.ws.Send(data)
+	}()
+
+	select {
+	case err := <-sendErr:
+		if err != nil {
+			return nil, err
+		}
+	case <-ctx.Done():
+		// Send is still running when ctx fired. In healthy operation Send
+		// completes in microseconds; reaching this branch means Send is
+		// genuinely stuck (e.g. Chrome died without TCP noticing). Close
+		// the conn to unblock the Write; the goroutine then exits.
+		_ = cdp.ws.Close()
+		return nil, ctx.Err()
 	}
 
 	select {
