@@ -847,8 +847,12 @@ func (p *Page) WaitIdle(timeout time.Duration) (err error) {
 // WaitRepaint waits until the next repaint.
 // Doc: https://developer.mozilla.org/en-US/docs/Web/API/window/requestAnimationFrame
 func (p *Page) WaitRepaint() error {
-	// we use root here because iframe doesn't trigger requestAnimationFrame
-	_, err := p.root.Eval(`() => new Promise(r => requestAnimationFrame(r))`)
+	// we use root here because iframe doesn't trigger requestAnimationFrame.
+	// p.root is the long-lived root Page with a stale background ctx, so we
+	// must re-apply p.ctx via .Context(...) — otherwise this eval ignores the
+	// caller's cancellation/timeout and can hang forever if rAF never fires
+	// (e.g. backgrounded/throttled tab).
+	_, err := p.root.Context(p.ctx).Eval(`() => new Promise(r => requestAnimationFrame(r))`)
 	return err
 }
 
