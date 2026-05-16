@@ -494,6 +494,13 @@ type ScrollScreenshotOptions struct {
 
 	// WaitPerScroll until no animation (default is 300ms)
 	WaitPerScroll time.Duration
+
+	// MaxHeight (optional) caps the total captured height in CSS pixels.
+	// Zero means no cap. Use this on pages with virtualized infinite
+	// scroll (social feeds, big-data tables), where CSSContentSize
+	// reports a synthetic height the loop would otherwise chase until
+	// the caller's context expires.
+	MaxHeight float64
 }
 
 // ScrollScreenshot Scroll screenshot does not adjust the size of the viewport,
@@ -523,6 +530,9 @@ func (p *Page) ScrollScreenshot(opt *ScrollScreenshotOptions) ([]byte, error) {
 
 	viewpointHeight := metrics.CSSVisualViewport.ClientHeight
 	contentHeight := metrics.CSSContentSize.Height
+	if opt.MaxHeight > 0 && opt.MaxHeight < contentHeight {
+		contentHeight = opt.MaxHeight
+	}
 
 	var scrollTop float64
 	var images []utils.ImgWithBox
