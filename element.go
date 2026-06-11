@@ -52,9 +52,12 @@ func (el *Element) Page() *Page {
 }
 
 // Focus sets focus on the specified element.
-// Before the action, it will try to scroll to the element.
+// Before the action, it will try to scroll to the element without waiting
+// for its shape to stabilize: focus doesn't need stable coordinates the way
+// pointer actions do, and the stability wait can hang on backgrounded tabs
+// (see [Element.ScrollIntoViewNoWait]).
 func (el *Element) Focus() error {
-	err := el.ScrollIntoView()
+	err := el.ScrollIntoViewNoWait()
 	if err != nil {
 		return err
 	}
@@ -73,6 +76,17 @@ func (el *Element) ScrollIntoView() error {
 	if err != nil {
 		return err
 	}
+
+	return proto.DOMScrollIntoViewIfNeeded{ObjectID: el.id()}.Call(el)
+}
+
+// ScrollIntoViewNoWait is like [Element.ScrollIntoView] but doesn't wait for
+// the element's shape to stabilize first. The stability wait depends on
+// requestAnimationFrame, which a backgrounded or throttled tab may never
+// fire, hanging the call until its context expires.
+func (el *Element) ScrollIntoViewNoWait() error {
+	defer el.tryTrace(TraceTypeInput, "scroll into view no wait")()
+	el.page.browser.trySlowMotion()
 
 	return proto.DOMScrollIntoViewIfNeeded{ObjectID: el.id()}.Call(el)
 }
@@ -671,9 +685,10 @@ func (el *Element) BackgroundImage() ([]byte, error) {
 	return el.page.Context(el.ctx).GetResource(u)
 }
 
-// Screenshot of the area of the element.
+// Screenshot of the area of the element. Scrolls to the element without
+// waiting for its shape to stabilize (see [Element.ScrollIntoViewNoWait]).
 func (el *Element) Screenshot(format proto.PageCaptureScreenshotFormat, quality int) ([]byte, error) {
-	err := el.ScrollIntoView()
+	err := el.ScrollIntoViewNoWait()
 	if err != nil {
 		return nil, err
 	}
