@@ -170,6 +170,15 @@ func (p *Page) SetBlockedURLs(urls []string) error {
 // Navigate to the url. If the url is empty, "about:blank" will be used.
 // It will return immediately after the server responds the http header.
 func (p *Page) Navigate(url string) error {
+	_, err := p.NavigateWithResult(url)
+	return err
+}
+
+// NavigateWithResult is like Navigate but returns the raw Page.navigate
+// result. The result's LoaderID is empty when the browser performed a
+// same-document navigation (e.g. a fragment-only URL change), in which
+// case no load event will fire.
+func (p *Page) NavigateWithResult(url string) (*proto.PageNavigateResult, error) {
 	if url == "" {
 		url = "about:blank"
 	}
@@ -179,15 +188,15 @@ func (p *Page) Navigate(url string) error {
 
 	res, err := proto.PageNavigate{URL: url}.Call(p)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if res.ErrorText != "" {
-		return &NavigationError{res.ErrorText}
+		return nil, &NavigationError{res.ErrorText}
 	}
 
 	p.root.unsetJSCtxID()
 
-	return nil
+	return res, nil
 }
 
 // NavigateBack history.
