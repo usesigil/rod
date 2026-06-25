@@ -60,7 +60,7 @@ var ContainsElement = &Function{
 // InitMouseTracer ...
 var InitMouseTracer = &Function{
 	Name:         "initMouseTracer",
-	Definition:   `async function(e,t){var n;await functions.waitLoad(),document.getElementById(e)||((n=document.createElement("div")).innerHTML=t,(t=n.lastChild).id=e,t.style="position: absolute; z-index: 2147483647; width: 17px; pointer-events: none;",t.removeAttribute("width"),t.removeAttribute("height"),document.body.parentElement.appendChild(t))}`,
+	Definition:   `async function(e,t){var n;await functions.waitLoad(),document.getElementById(e)||((n=document.createElement("div")).innerHTML=t,(t=n.lastChild).id=e,t.style="position: absolute; z-index: 2147483647; width: 17px; pointer-events: none; transition: left 0.12s ease-out, top 0.12s ease-out;",t.removeAttribute("width"),t.removeAttribute("height"),document.body.parentElement.appendChild(t))}`,
 	Dependencies: []*Function{WaitLoad},
 }
 

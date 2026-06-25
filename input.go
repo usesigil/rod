@@ -240,7 +240,7 @@ func (m *Mouse) MoveTo(p proto.Point) error {
 	// to make sure set only when call is successful
 	m.pos = p
 
-	if m.page.browser.trace {
+	if m.page.browser.trace || m.page.browser.cursor {
 		if !m.updateMouseTracer() {
 			m.initMouseTracer()
 			m.updateMouseTracer()

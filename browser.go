@@ -47,6 +47,7 @@ type Browser struct {
 
 	slowMotion time.Duration // see defaults.slow
 	trace      bool          // see defaults.Trace
+	cursor     bool          // see Browser.ShowCursor
 	monitor    string
 
 	defaultDevice devices.Device
@@ -109,6 +110,14 @@ func (b *Browser) SlowMotion(delay time.Duration) *Browser {
 // Trace enables/disables the visual tracing of the input actions on the page.
 func (b *Browser) Trace(enable bool) *Browser {
 	b.trace = enable
+	return b
+}
+
+// ShowCursor draws a visible mouse cursor that follows input actions, without
+// enabling the rest of trace's debug overlays and logging. Intended for demo
+// recordings where only the pointer should be visible.
+func (b *Browser) ShowCursor(enable bool) *Browser {
+	b.cursor = enable
 	return b
 }
 
