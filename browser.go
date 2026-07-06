@@ -343,6 +343,7 @@ func (b *Browser) PageFromTarget(targetID proto.TargetTargetID) (*Page, error) {
 		jsCtxLock:     &sync.Mutex{},
 		jsCtxID:       new(proto.RuntimeRemoteObjectID),
 		helpersLock:   &sync.Mutex{},
+		helpers:       map[proto.RuntimeRemoteObjectID]map[string]proto.RuntimeRemoteObjectID{},
 	}
 
 	page.root = page

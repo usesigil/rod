@@ -123,11 +123,13 @@ func (p *Page) Eval(js string, args ...interface{}) (*proto.RuntimeRemoteObject,
 func (p *Page) Evaluate(opts *EvalOptions) (res *proto.RuntimeRemoteObject, err error) {
 	var backoff utils.Sleeper
 
-	// js context will be invalid if a frame is reloaded or not ready, then the isNilContextErr
-	// will be true, then we retry the eval again.
+	// The js context becomes invalid when a frame reloads or isn't ready yet
+	// (ErrCtxNotFound), or when a navigation destroys it mid-eval
+	// (ErrCtxDestroyed). Both mean the same thing for a page-bound eval:
+	// re-resolve the context and retry.
 	for {
 		res, err = p.evaluate(opts)
-		if err != nil && errors.Is(err, cdp.ErrCtxNotFound) {
+		if err != nil && (errors.Is(err, cdp.ErrCtxNotFound) || errors.Is(err, cdp.ErrCtxDestroyed)) {
 			if opts.ThisObj != nil {
 				return nil, &ObjectNotFoundError{opts.ThisObj}
 			}
@@ -305,10 +307,6 @@ func (p *Page) getHelper(jsCtxID proto.RuntimeRemoteObjectID, name string) (prot
 	p.helpersLock.Lock()
 	defer p.helpersLock.Unlock()
 
-	if p.helpers == nil {
-		p.helpers = map[proto.RuntimeRemoteObjectID]map[string]proto.RuntimeRemoteObjectID{}
-	}
-
 	list, ok := p.helpers[jsCtxID]
 	if !ok {
 		list = map[string]proto.RuntimeRemoteObjectID{}
@@ -342,8 +340,10 @@ func (p *Page) getJSCtxID() (proto.RuntimeRemoteObjectID, error) {
 		}
 
 		*p.jsCtxID = obj.Result.ObjectID
+		// The map is shared by all clones of this page (and its frames), so
+		// clear it in place; reassigning would only detach this clone's copy.
 		p.helpersLock.Lock()
-		p.helpers = nil
+		clear(p.helpers)
 		p.helpersLock.Unlock()
 		return *p.jsCtxID, nil
 	}
