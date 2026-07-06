@@ -11,29 +11,37 @@ import (
 )
 
 // Keyboard represents the keyboard on a page, it's always related the main frame.
+// It's a thin wrapper that carries the page (and so the page's ctx); the key
+// state is shared between all clones of the same page, see [Page.Context].
 type Keyboard struct {
-	sync.Mutex
+	page  *Page
+	state *keyboardState
+}
 
-	page *Page
+// keyboardState is shared between all Keyboard clones of the same page.
+// The mutex only guards the state; it's never held across CDP calls, so a
+// stuck call can't block other input on the page.
+type keyboardState struct {
+	sync.Mutex
 
 	// pressed keys must be released before it can be pressed again
 	pressed map[input.Key]struct{}
 }
 
 func (p *Page) newKeyboard() *Page {
-	p.Keyboard = &Keyboard{page: p, pressed: map[input.Key]struct{}{}}
+	p.Keyboard = &Keyboard{page: p, state: &keyboardState{pressed: map[input.Key]struct{}{}}}
 	return p
 }
 
 func (k *Keyboard) getModifiers() int {
-	k.Lock()
-	defer k.Unlock()
-	return k.modifiers()
+	k.state.Lock()
+	defer k.state.Unlock()
+	return k.state.modifiers()
 }
 
-func (k *Keyboard) modifiers() int {
+func (s *keyboardState) modifiers() int {
 	ms := 0
-	for key := range k.pressed {
+	for key := range s.pressed {
 		ms |= key.Modifier()
 	}
 	return ms
@@ -46,28 +54,28 @@ func (k *Keyboard) Press(key input.Key) error {
 	defer k.page.tryTrace(TraceTypeInput, "press key: "+key.Info().Code)()
 	k.page.browser.trySlowMotion()
 
-	k.Lock()
-	defer k.Unlock()
+	k.state.Lock()
+	k.state.pressed[key] = struct{}{}
+	modifiers := k.state.modifiers()
+	k.state.Unlock()
 
-	k.pressed[key] = struct{}{}
-
-	return key.Encode(proto.InputDispatchKeyEventTypeKeyDown, k.modifiers()).Call(k.page)
+	return key.Encode(proto.InputDispatchKeyEventTypeKeyDown, modifiers).Call(k.page)
 }
 
 // Release the key.
 func (k *Keyboard) Release(key input.Key) error {
 	defer k.page.tryTrace(TraceTypeInput, "release key: "+key.Info().Code)()
 
-	k.Lock()
-	defer k.Unlock()
-
-	if _, has := k.pressed[key]; !has {
+	k.state.Lock()
+	if _, has := k.state.pressed[key]; !has {
+		k.state.Unlock()
 		return nil
 	}
+	delete(k.state.pressed, key)
+	modifiers := k.state.modifiers()
+	k.state.Unlock()
 
-	delete(k.pressed, key)
-
-	return key.Encode(proto.InputDispatchKeyEventTypeKeyUp, k.modifiers()).Call(k.page)
+	return key.Encode(proto.InputDispatchKeyEventTypeKeyUp, modifiers).Call(k.page)
 }
 
 // Type releases the key after the press.
@@ -191,10 +199,18 @@ func (p *Page) InsertText(text string) error {
 }
 
 // Mouse represents the mouse on a page, it's always related the main frame.
+// It's a thin wrapper that carries the page (and so the page's ctx); the
+// cursor state is shared between all clones of the same page, see [Page.Context].
 type Mouse struct {
-	sync.Mutex
+	page  *Page
+	state *mouseState
+}
 
-	page *Page
+// mouseState is shared between all Mouse clones of the same page.
+// The mutex only guards the state; it's never held across CDP calls, so a
+// stuck call can't block other input on the page.
+type mouseState struct {
+	sync.Mutex
 
 	id string // mouse svg dom element id
 
@@ -205,23 +221,22 @@ type Mouse struct {
 }
 
 func (p *Page) newMouse() *Page {
-	p.Mouse = &Mouse{page: p, id: utils.RandString(8)}
+	p.Mouse = &Mouse{page: p, state: &mouseState{id: utils.RandString(8)}}
 	return p
 }
 
 // Position of current cursor.
 func (m *Mouse) Position() proto.Point {
-	m.Lock()
-	defer m.Unlock()
-	return m.pos
+	m.state.Lock()
+	defer m.state.Unlock()
+	return m.state.pos
 }
 
 // MoveTo the absolute position.
 func (m *Mouse) MoveTo(p proto.Point) error {
-	m.Lock()
-	defer m.Unlock()
-
-	button, buttons := input.EncodeMouseButton(m.buttons)
+	m.state.Lock()
+	button, buttons := input.EncodeMouseButton(m.state.buttons)
+	m.state.Unlock()
 
 	m.page.browser.trySlowMotion()
 
@@ -238,7 +253,9 @@ func (m *Mouse) MoveTo(p proto.Point) error {
 	}
 
 	// to make sure set only when call is successful
-	m.pos = p
+	m.state.Lock()
+	m.state.pos = p
+	m.state.Unlock()
 
 	if m.page.browser.trace || m.page.browser.cursor {
 		if !m.updateMouseTracer() {
@@ -287,9 +304,6 @@ func (m *Mouse) MoveLinear(to proto.Point, steps int) error {
 
 // Scroll the relative offset with specified steps.
 func (m *Mouse) Scroll(offsetX, offsetY float64, steps int) error {
-	m.Lock()
-	defer m.Unlock()
-
 	defer m.page.tryTrace(TraceTypeInput, fmt.Sprintf("scroll (%.2f, %.2f)", offsetX, offsetY))()
 	m.page.browser.trySlowMotion()
 
@@ -297,7 +311,10 @@ func (m *Mouse) Scroll(offsetX, offsetY float64, steps int) error {
 		steps = 1
 	}
 
-	button, buttons := input.EncodeMouseButton(m.buttons)
+	m.state.Lock()
+	button, buttons := input.EncodeMouseButton(m.state.buttons)
+	pos := m.state.pos
+	m.state.Unlock()
 
 	stepX := offsetX / float64(steps)
 	stepY := offsetY / float64(steps)
@@ -310,8 +327,8 @@ func (m *Mouse) Scroll(offsetX, offsetY float64, steps int) error {
 			Modifiers: m.page.Keyboard.getModifiers(),
 			DeltaX:    stepX,
 			DeltaY:    stepY,
-			X:         m.pos.X,
-			Y:         m.pos.Y,
+			X:         pos.X,
+			Y:         pos.Y,
 		}.Call(m.page)
 		if err != nil {
 			return err
@@ -323,12 +340,11 @@ func (m *Mouse) Scroll(offsetX, offsetY float64, steps int) error {
 
 // Down holds the button down.
 func (m *Mouse) Down(button proto.InputMouseButton, clickCount int) error {
-	m.Lock()
-	defer m.Unlock()
-
-	toButtons := append(append([]proto.InputMouseButton{}, m.buttons...), button)
-
+	m.state.Lock()
+	toButtons := append(append([]proto.InputMouseButton{}, m.state.buttons...), button)
 	_, buttons := input.EncodeMouseButton(toButtons)
+	pos := m.state.pos
+	m.state.Unlock()
 
 	err := proto.InputDispatchMouseEvent{
 		Type:       proto.InputDispatchMouseEventTypeMousePressed,
@@ -336,30 +352,32 @@ func (m *Mouse) Down(button proto.InputMouseButton, clickCount int) error {
 		Buttons:    gson.Int(buttons),
 		ClickCount: clickCount,
 		Modifiers:  m.page.Keyboard.getModifiers(),
-		X:          m.pos.X,
-		Y:          m.pos.Y,
+		X:          pos.X,
+		Y:          pos.Y,
 	}.Call(m.page)
 	if err != nil {
 		return err
 	}
-	m.buttons = toButtons
+
+	m.state.Lock()
+	m.state.buttons = toButtons
+	m.state.Unlock()
 	return nil
 }
 
 // Up releases the button.
 func (m *Mouse) Up(button proto.InputMouseButton, clickCount int) error {
-	m.Lock()
-	defer m.Unlock()
-
+	m.state.Lock()
 	toButtons := []proto.InputMouseButton{}
-	for _, btn := range m.buttons {
+	for _, btn := range m.state.buttons {
 		if btn == button {
 			continue
 		}
 		toButtons = append(toButtons, btn)
 	}
-
 	_, buttons := input.EncodeMouseButton(toButtons)
+	pos := m.state.pos
+	m.state.Unlock()
 
 	err := proto.InputDispatchMouseEvent{
 		Type:       proto.InputDispatchMouseEventTypeMouseReleased,
@@ -367,13 +385,16 @@ func (m *Mouse) Up(button proto.InputMouseButton, clickCount int) error {
 		Buttons:    gson.Int(buttons),
 		ClickCount: clickCount,
 		Modifiers:  m.page.Keyboard.getModifiers(),
-		X:          m.pos.X,
-		Y:          m.pos.Y,
+		X:          pos.X,
+		Y:          pos.Y,
 	}.Call(m.page)
 	if err != nil {
 		return err
 	}
-	m.buttons = toButtons
+
+	m.state.Lock()
+	m.state.buttons = toButtons
+	m.state.Unlock()
 	return nil
 }
 

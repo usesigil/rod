@@ -5,6 +5,7 @@
 package rod
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -223,12 +224,28 @@ func (el *Element) tryTrace(typ TraceType, msg ...interface{}) func() {
 	return el.Overlay(fmt.Sprint(msg))
 }
 
+// tracerPage bounds the tracer's JS evals to a short timeout. A modal JS
+// dialog suspends evals (but not Input.dispatch* events), so an unbounded
+// eval here would block input on the page until the dialog is dismissed.
+func (m *Mouse) tracerPage() (*Page, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(m.page.ctx, time.Second)
+	return m.page.Context(ctx), cancel
+}
+
 func (m *Mouse) initMouseTracer() {
-	_, _ = m.page.Evaluate(evalHelper(js.InitMouseTracer, m.id, assets.MousePointer).ByPromise())
+	page, cancel := m.tracerPage()
+	defer cancel()
+	_, _ = page.Evaluate(evalHelper(js.InitMouseTracer, m.state.id, assets.MousePointer).ByPromise())
 }
 
 func (m *Mouse) updateMouseTracer() bool {
-	res, err := m.page.Evaluate(evalHelper(js.UpdateMouseTracer, m.id, m.pos.X, m.pos.Y))
+	m.state.Lock()
+	pos := m.state.pos
+	m.state.Unlock()
+
+	page, cancel := m.tracerPage()
+	defer cancel()
+	res, err := page.Evaluate(evalHelper(js.UpdateMouseTracer, m.state.id, pos.X, pos.Y))
 	if err != nil {
 		return true
 	}

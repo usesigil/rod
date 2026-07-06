@@ -109,7 +109,7 @@ func (el *Element) MoveMouseOut() error {
 		return err
 	}
 	box := shape.Box()
-	return el.page.Mouse.MoveTo(proto.NewPoint(box.X+box.Width, box.Y))
+	return el.page.Context(el.ctx).Mouse.MoveTo(proto.NewPoint(box.X+box.Width, box.Y))
 }
 
 // Click will press then release the button just like a human.
