@@ -213,14 +213,20 @@ func (p *Page) Expose(name string, fn func(gson.JSON) (interface{}, error)) (sto
 		return proto.RuntimeRemoveBinding{Name: bind}.Call(p)
 	}
 
-	go p.EachEvent(func(e *proto.RuntimeBindingCalled) {
+	// The listener runs for the page's life; its wait only ends with the ctx,
+	// so the error is just the cancellation.
+	wait := p.EachEvent(func(e *proto.RuntimeBindingCalled) {
 		if e.Name == bind {
 			payload := gson.NewFrom(e.Payload)
 			res, err := fn(payload.Get("req"))
 			code := fmt.Sprintf("(res, err) => %s(res, err)", payload.Get("cb").Str())
+			// No propagation path from this event goroutine; a failed
+			// delivery is observable page-side as the never-resolving
+			// callback promise.
 			_, _ = p.Evaluate(Eval(code, res, err))
 		}
-	})()
+	})
+	go func() { _ = wait() }()
 
 	return
 }

@@ -137,14 +137,20 @@ func (p *Page) SetCookies(cookies []*proto.NetworkCookieParam) error {
 }
 
 // SetExtraHeaders whether to always send extra HTTP headers with the requests from this page.
-func (p *Page) SetExtraHeaders(dict []string) (func(), error) {
+// The returned cleanup reports whether removing the override succeeded.
+func (p *Page) SetExtraHeaders(dict []string) (func() error, error) {
 	headers := proto.NetworkHeaders{}
 
 	for i := 0; i < len(dict); i += 2 {
 		headers[dict[i]] = gson.New(dict[i+1])
 	}
 
-	return p.EnableDomain(&proto.NetworkEnable{}), proto.NetworkSetExtraHTTPHeaders{Headers: headers}.Call(p)
+	restore, err := p.EnableDomain(&proto.NetworkEnable{})
+	if err != nil {
+		return restore, err
+	}
+
+	return restore, proto.NetworkSetExtraHTTPHeaders{Headers: headers}.Call(p)
 }
 
 // SetUserAgent (browser brand, accept-language, etc) of the page.
@@ -183,7 +189,9 @@ func (p *Page) NavigateWithResult(url string) (*proto.PageNavigateResult, error)
 		url = "about:blank"
 	}
 
-	// try to stop loading
+	// Try to stop loading; deliberately not propagated. If it fails while
+	// something real is wrong, the Page.navigate call right below surfaces
+	// it; failing the navigation over this pre-step would be wrong.
 	_ = p.StopLoading()
 
 	res, err := proto.PageNavigate{URL: url}.Call(p)
@@ -239,7 +247,9 @@ func (p *Page) Reload() error {
 		return err
 	}
 
-	wait()
+	if err := wait(); err != nil {
+		return err
+	}
 
 	p.unsetJSCtxID()
 
@@ -399,19 +409,28 @@ func (p *Page) TriggerFavicon() error {
 //	wait()
 //	handle(true, "")
 func (p *Page) HandleDialog() (
-	wait func() *proto.PageJavascriptDialogOpening,
+	wait func() (*proto.PageJavascriptDialogOpening, error),
 	handle func(*proto.PageHandleJavaScriptDialog) error,
 ) {
-	restore := p.EnableDomain(&proto.PageEnable{})
+	restore, enableErr := p.EnableDomain(&proto.PageEnable{})
 
 	var e proto.PageJavascriptDialogOpening
 	w := p.WaitEvent(&e)
 
-	return func() *proto.PageJavascriptDialogOpening {
-			w()
-			return &e
-		}, func(h *proto.PageHandleJavaScriptDialog) error {
-			defer restore()
+	return func() (*proto.PageJavascriptDialogOpening, error) {
+			if enableErr != nil {
+				return nil, enableErr
+			}
+			if err := w(); err != nil {
+				return nil, err
+			}
+			return &e, nil
+		}, func(h *proto.PageHandleJavaScriptDialog) (err error) {
+			defer func() {
+				if rerr := restore(); rerr != nil && err == nil {
+					err = rerr
+				}
+			}()
 			return h.Call(p)
 		}
 }
@@ -428,7 +447,9 @@ func (p *Page) HandleFileDialog() (func([]string) error, error) {
 	w := p.WaitEvent(&e)
 
 	return func(paths []string) error {
-		w()
+		if err := w(); err != nil {
+			return err
+		}
 
 		err := proto.PageSetInterceptFileChooserDialog{Enabled: false}.Call(p)
 		if err != nil {
@@ -443,7 +464,7 @@ func (p *Page) HandleFileDialog() (func([]string) error, error) {
 }
 
 // Screenshot captures the screenshot of current page.
-func (p *Page) Screenshot(fullPage bool, req *proto.PageCaptureScreenshot) ([]byte, error) {
+func (p *Page) Screenshot(fullPage bool, req *proto.PageCaptureScreenshot) (bin []byte, err error) {
 	if req == nil {
 		req = &proto.PageCaptureScreenshot{}
 	}
@@ -468,13 +489,24 @@ func (p *Page) Screenshot(fullPage bool, req *proto.PageCaptureScreenshot) ([]by
 			return nil, err
 		}
 
-		defer func() { // try to recover the viewport
-			if !set {
-				_ = proto.EmulationClearDeviceMetricsOverride{}.Call(p)
-				return
-			}
+		defer func() { // recover the viewport
+			// A failed restore leaves the user's real tab resized to content
+			// height. The action ctx may be the reason the capture failed,
+			// so restore on a short detached ctx, and report the failure
+			// unless the capture already failed for a more primary reason.
+			ctx, done := context.WithTimeout(p.browser.rootContext(), 5*time.Second)
+			defer done()
+			restorePage := p.Context(ctx)
 
-			_ = p.SetViewport(&oldView)
+			var rerr error
+			if !set {
+				rerr = proto.EmulationClearDeviceMetricsOverride{}.Call(restorePage)
+			} else {
+				rerr = restorePage.SetViewport(&oldView)
+			}
+			if rerr != nil && err == nil {
+				err = fmt.Errorf("restoring viewport after screenshot: %w", rerr)
+			}
 		}()
 	}
 
@@ -617,7 +649,10 @@ func (p *Page) ScrollScreenshot(opt *ScrollScreenshotOptions) ([]byte, error) {
 // `Strings` Shared string table that all string properties refer to with indexes.
 // Normally use `Strings` is enough.
 func (p *Page) CaptureDOMSnapshot() (domSnapshot *proto.DOMSnapshotCaptureSnapshotResult, err error) {
-	_ = proto.DOMSnapshotEnable{}.Call(p)
+	err = proto.DOMSnapshotEnable{}.Call(p)
+	if err != nil {
+		return nil, err
+	}
 
 	snapshot, err := proto.DOMSnapshotCaptureSnapshot{
 		ComputedStyles:                 []string{},
@@ -679,7 +714,9 @@ func (p *Page) WaitOpen() func() (*Page, error) {
 
 	return func() (*Page, error) {
 		defer p.tryTrace(TraceTypeWait, "wait open")()
-		wait()
+		if err := wait(); err != nil {
+			return nil, err
+		}
 		return b.PageFromTarget(targetID)
 	}
 }
@@ -699,29 +736,59 @@ func (p *Page) WaitOpen() func() (*Page, error) {
 //	go page.EachEvent(func(e *proto.PageJavascriptDialogOpening) {
 //	    _ = proto.PageHandleJavaScriptDialog{ Accept: false, PromptText: ""}.Call(page)
 //	})()
-func (p *Page) EachEvent(callbacks ...interface{}) (wait func()) {
+func (p *Page) EachEvent(callbacks ...interface{}) (wait func() error) {
 	return p.browser.Context(p.ctx).eachEvent(p.SessionID, callbacks...)
 }
 
 // WaitEvent waits for the next event for one time. It will also load the data into the event object.
-func (p *Page) WaitEvent(e proto.Event) (wait func()) {
+func (p *Page) WaitEvent(e proto.Event) (wait func() error) {
 	defer p.tryTrace(TraceTypeWait, "event", e.ProtoEvent())()
 	return p.browser.Context(p.ctx).waitEvent(p.SessionID, e)
 }
 
 // WaitNavigation wait for a page lifecycle event when navigating.
 // Usually you will wait for [proto.PageLifecycleEventNameNetworkAlmostIdle].
-func (p *Page) WaitNavigation(name proto.PageLifecycleEventName) func() {
-	_ = proto.PageSetLifecycleEventsEnabled{Enabled: true}.Call(p)
+//
+// Only events of this page's main frame count: a same-process iframe's
+// lifecycle events (ads, consent frames) can no longer satisfy the wait.
+// Pass the LoaderID returned by [Page.NavigateWithResult] to additionally
+// pin the wait to that exact navigation. Without it, Chrome's replay of the
+// CURRENT document's lifecycle state (sent whenever lifecycle events are
+// enabled) can satisfy the wait instantly on an already-loaded page.
+func (p *Page) WaitNavigation(name proto.PageLifecycleEventName) func(loaderID ...proto.NetworkLoaderID) error {
+	var loader proto.NetworkLoaderID
 
-	wait := p.EachEvent(func(e *proto.PageLifecycleEvent) bool {
-		return e.Name == name
+	// Subscribe before enabling lifecycle events so nothing lands in the gap.
+	// Events are buffered from here on and the predicate runs during wait's
+	// drain, by which time the caller has supplied the LoaderID.
+	waitPage, cancelWait := p.WithCancel()
+	wait := waitPage.EachEvent(func(e *proto.PageLifecycleEvent) bool {
+		if e.Name != name || e.FrameID != p.FrameID {
+			return false
+		}
+		return loader == "" || e.LoaderID == loader
 	})
 
-	return func() {
+	if err := (proto.PageSetLifecycleEventsEnabled{Enabled: true}).Call(p); err != nil {
+		// The event can never arrive: fail fast instead of returning a wait
+		// that burns its whole budget. Cancel to release the subscription.
+		cancelWait()
+		return func(...proto.NetworkLoaderID) error { return err }
+	}
+
+	return func(loaderID ...proto.NetworkLoaderID) error {
+		defer cancelWait()
+		if len(loaderID) > 0 {
+			loader = loaderID[0]
+		}
 		defer p.tryTrace(TraceTypeWait, "navigation", name)()
-		wait()
-		_ = proto.PageSetLifecycleEventsEnabled{Enabled: false}.Call(p)
+		err := wait()
+		// A failed disable leaves lifecycle events on; report it unless the
+		// wait already failed for a more primary reason.
+		if derr := (proto.PageSetLifecycleEventsEnabled{Enabled: false}).Call(p); derr != nil && err == nil {
+			err = derr
+		}
+		return err
 	}
 }
 
@@ -733,7 +800,7 @@ func (p *Page) WaitRequestIdle(
 	d time.Duration,
 	includes, excludes []string,
 	excludeTypes []proto.NetworkResourceType,
-) func() {
+) func() error {
 	defer p.tryTrace(TraceTypeWait, "request-idle")()
 
 	if excludeTypes == nil {
@@ -750,11 +817,11 @@ func (p *Page) WaitRequestIdle(
 		includes = []string{""}
 	}
 
-	p, cancel := p.WithCancel()
+	waitPage, cancel := p.WithCancel()
 	match := genRegMatcher(includes, excludes)
 	waitList := map[proto.NetworkRequestID]string{}
 	idleCounter := utils.NewIdleCounter(d)
-	update := p.tryTraceReq(includes, excludes)
+	update := waitPage.tryTraceReq(includes, excludes)
 	update(nil)
 
 	checkDone := func(id proto.NetworkRequestID) {
@@ -765,7 +832,7 @@ func (p *Page) WaitRequestIdle(
 		}
 	}
 
-	wait := p.EachEvent(func(sent *proto.NetworkRequestWillBeSent) {
+	wait := waitPage.EachEvent(func(sent *proto.NetworkRequestWillBeSent) {
 		for _, t := range excludeTypes {
 			if sent.Type == t {
 				return
@@ -787,12 +854,22 @@ func (p *Page) WaitRequestIdle(
 		checkDone(e.RequestID)
 	})
 
-	return func() {
+	return func() error {
 		go func() {
-			idleCounter.Wait(p.ctx)
+			idleCounter.Wait(waitPage.ctx)
 			cancel()
 		}()
-		wait()
+		err := wait()
+		// Reaching idle ends the wait by cancelling our own subscription, so
+		// an error here only counts when the CALLER's ctx died (timeout) or
+		// the event stream closed for another reason.
+		if ctxErr := p.ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		return err
 	}
 }
 
@@ -848,7 +925,8 @@ func (p *Page) WaitStable(d time.Duration) error {
 		e := p.WaitLoad()
 		setErr.Do(func() { err = e })
 	}, func() {
-		p.WaitRequestIdle(d, nil, nil, nil)()
+		e := p.WaitRequestIdle(d, nil, nil, nil)()
+		setErr.Do(func() { err = e })
 	}, func() {
 		e := p.WaitDOMStable(d, 0)
 		setErr.Do(func() { err = e })

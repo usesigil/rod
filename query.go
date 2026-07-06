@@ -249,13 +249,22 @@ func (p *Page) ElementsByJS(opts *EvalOptions) (Elements, error) {
 // The query can be plain text or css selector or xpath.
 // It will search nested iframes and shadow doms too.
 func (p *Page) Search(query string) (*SearchResult, error) {
-	sr := &SearchResult{
-		page:    p,
-		restore: p.EnableDomain(proto.DOMEnable{}),
+	restore, err := p.EnableDomain(proto.DOMEnable{})
+	if err != nil {
+		return nil, err
 	}
 
-	err := utils.Retry(p.ctx, p.sleeper(), func() (bool, error) {
+	sr := &SearchResult{
+		page:    p,
+		restore: restore,
+	}
+
+	err = utils.Retry(p.ctx, p.sleeper(), func() (bool, error) {
 		if sr.DOMPerformSearchResult != nil {
+			// Discard of the superseded search is deliberately not
+			// propagated: it can fail benignly (the search session is gone
+			// after a navigation), and any real failure surfaces on the
+			// DOMPerformSearch call right below.
 			_ = proto.DOMDiscardSearchResults{SearchID: sr.SearchID}.Call(p)
 		}
 
@@ -296,7 +305,9 @@ func (p *Page) Search(query string) (*SearchResult, error) {
 		// invalidate all the existing NodeID. We have to call proto.DOMGetDocument
 		// to reset the remote browser's tracker.
 		if id == 0 {
-			_, _ = proto.DOMGetDocument{}.Call(p)
+			if _, err := (proto.DOMGetDocument{}).Call(p); err != nil {
+				return true, err
+			}
 			return false, nil
 		}
 
@@ -321,7 +332,7 @@ type SearchResult struct {
 	*proto.DOMPerformSearchResult
 
 	page    *Page
-	restore func()
+	restore func() error
 
 	// First element in the search result
 	First *Element
@@ -357,9 +368,12 @@ func (s *SearchResult) All() (Elements, error) {
 }
 
 // Release the remote search result.
-func (s *SearchResult) Release() {
-	s.restore()
-	_ = proto.DOMDiscardSearchResults{SearchID: s.SearchID}.Call(s.page)
+func (s *SearchResult) Release() (err error) {
+	err = s.restore()
+	if derr := (proto.DOMDiscardSearchResults{SearchID: s.SearchID}).Call(s.page); derr != nil && err == nil {
+		err = derr
+	}
+	return err
 }
 
 type raceBranch struct {

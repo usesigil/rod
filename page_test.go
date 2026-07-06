@@ -193,7 +193,9 @@ func TestLoadState(t *testing.T) {
 func TestDisableDomain(t *testing.T) {
 	g := setup(t)
 
-	defer g.page.DisableDomain(&proto.PageEnable{})()
+	restore, err := g.page.DisableDomain(&proto.PageEnable{})
+	g.E(err)
+	defer restore()
 }
 
 func TestPageContext(t *testing.T) {

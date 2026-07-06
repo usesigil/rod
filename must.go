@@ -123,7 +123,8 @@ func (b *Browser) MustWaitDownload() func() []byte {
 	wait := b.WaitDownload(tmpDir)
 
 	return func() []byte {
-		info := wait()
+		info, err := wait()
+		b.e(err)
 		path := filepath.Join(tmpDir, info.GUID)
 		defer func() { _ = os.Remove(path) }()
 		data, err := os.ReadFile(path)
@@ -210,9 +211,9 @@ func (p *Page) MustSetCookies(cookies ...*proto.NetworkCookieParam) *Page {
 
 // MustSetExtraHeaders is similar to [Page.SetExtraHeaders].
 func (p *Page) MustSetExtraHeaders(dict ...string) (cleanup func()) {
-	cleanup, err := p.SetExtraHeaders(dict)
+	c, err := p.SetExtraHeaders(dict)
 	p.e(err)
-	return
+	return func() { p.e(c()) }
 }
 
 // MustSetUserAgent is similar to [Page.SetUserAgent].
@@ -345,7 +346,11 @@ func (p *Page) MustClose() {
 // MustHandleDialog is similar to [Page.HandleDialog].
 func (p *Page) MustHandleDialog() (wait func() *proto.PageJavascriptDialogOpening, handle func(bool, string)) {
 	w, h := p.HandleDialog()
-	return w, func(accept bool, promptText string) {
+	return func() *proto.PageJavascriptDialogOpening {
+		e, err := w()
+		p.e(err)
+		return e
+	}, func(accept bool, promptText string) {
 		p.e(h(&proto.PageHandleJavaScriptDialog{
 			Accept:     accept,
 			PromptText: promptText,
@@ -426,12 +431,14 @@ func (p *Page) MustWaitOpen() (wait func() (newPage *Page)) {
 
 // MustWaitNavigation is similar to [Page.WaitNavigation].
 func (p *Page) MustWaitNavigation() func() {
-	return p.WaitNavigation(proto.PageLifecycleEventNameNetworkAlmostIdle)
+	wait := p.WaitNavigation(proto.PageLifecycleEventNameNetworkAlmostIdle)
+	return func() { wait() }
 }
 
 // MustWaitRequestIdle is similar to [Page.WaitRequestIdle].
 func (p *Page) MustWaitRequestIdle(excludes ...string) (wait func()) {
-	return p.WaitRequestIdle(300*time.Millisecond, nil, excludes, nil)
+	w := p.WaitRequestIdle(300*time.Millisecond, nil, excludes, nil)
+	return func() { p.e(w()) }
 }
 
 // MustWaitIdle is similar to [Page.WaitIdle].
@@ -573,7 +580,7 @@ func (p *Page) MustHasR(selector, regex string) bool {
 func (p *Page) MustSearch(query string) *Element {
 	res, err := p.Search(query)
 	p.e(err)
-	res.Release()
+	p.e(res.Release())
 	return res.First
 }
 

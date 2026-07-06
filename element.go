@@ -289,7 +289,13 @@ func (el *Element) Input(text string) error {
 	}
 
 	err = el.page.Context(el.ctx).InsertText(text)
-	_, _ = el.Evaluate(evalHelper(js.InputEvent).ByUser())
+	if err != nil {
+		return err
+	}
+
+	// Fire the JS "input" event; frameworks watch it to pick up the change.
+	// If it fails the input silently didn't take effect for the app.
+	_, err = el.Evaluate(evalHelper(js.InputEvent).ByUser())
 	return err
 }
 

@@ -2,6 +2,7 @@ package rod
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/go-rod/rod/lib/proto"
@@ -191,3 +192,7 @@ func (e *NoShadowRootError) Error() string {
 
 // Is interface.
 func (e *NoShadowRootError) Is(err error) bool { _, ok := err.(*NoShadowRootError); return ok }
+
+// ErrEventStreamClosed means the browser's event stream closed before the
+// expected event arrived, e.g. the CDP connection died while waiting.
+var ErrEventStreamClosed = errors.New("rod: event stream closed before the event arrived")

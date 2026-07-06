@@ -37,7 +37,10 @@ func main() {
 
 	page.MustElementR("a", "Download ZIP").MustClick()
 
-	res := wait()
+	res, err := wait()
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	log.Printf("wrote %s", filepath.Join(wd, res.GUID))
 }

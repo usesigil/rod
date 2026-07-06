@@ -9,6 +9,7 @@ package rod
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -210,9 +211,16 @@ func (b *Browser) Page(opts proto.TargetCreateTarget) (p *Page, err error) {
 		return nil, err
 	}
 	defer func() {
-		// If Navigate or PageFromTarget fails we should close the target to prevent leak
+		// If Navigate or PageFromTarget fails we should close the target to
+		// prevent a leak. The failure often means the receiver's ctx is
+		// already dead, so close on an independent short ctx (runZero
+		// 22837ae); a failed close is appended to the primary error.
 		if err != nil {
-			_, _ = proto.TargetCloseTarget{TargetID: target.TargetID}.Call(b)
+			ctx, done := context.WithTimeout(b.rootContext(), 5*time.Second)
+			defer done()
+			if _, cerr := (proto.TargetCloseTarget{TargetID: target.TargetID}).Call(b.Context(ctx)); cerr != nil {
+				err = fmt.Errorf("%w (rollback close of target %s failed: %v)", err, target.TargetID, cerr)
+			}
 		}
 	}()
 
@@ -316,11 +324,11 @@ func (b *Browser) PageFromTarget(targetID proto.TargetTargetID) (*Page, error) {
 	// The receiver's ctx may already be dead when cleanup runs (a timeout
 	// mid-setup is exactly when cleanup is needed), so detach on its own
 	// short ctx derived from the root ctx.
-	detach := func() {
+	detach := func() error {
 		cancel()
 		ctx, done := context.WithTimeout(b.rootContext(), 5*time.Second)
 		defer done()
-		_ = proto.TargetDetachFromTarget{SessionID: session.SessionID}.Call(b.Context(ctx))
+		return proto.TargetDetachFromTarget{SessionID: session.SessionID}.Call(b.Context(ctx))
 	}
 
 	page = &Page{
@@ -343,7 +351,9 @@ func (b *Browser) PageFromTarget(targetID proto.TargetTargetID) (*Page, error) {
 	if !b.defaultDevice.IsClear() {
 		err = page.Context(b.ctx).Emulate(b.defaultDevice)
 		if err != nil {
-			detach()
+			if derr := detach(); derr != nil {
+				err = fmt.Errorf("%w (detach of session failed: %v)", err, derr)
+			}
 			return nil, err
 		}
 	}
@@ -353,36 +363,45 @@ func (b *Browser) PageFromTarget(targetID proto.TargetTargetID) (*Page, error) {
 	// insert race below, detach's cancel stops the pump again.
 	page.initEvents()
 
+	// If we don't enable it, it will cause a lot of unexpected browser behavior.
+	// Such as proto.PageAddScriptToEvaluateOnNewDocument won't work. A page
+	// whose Page domain failed to enable is broken for its whole life, so
+	// fail the attach instead of caching it.
+	if _, err := page.Context(b.ctx).EnableDomain(&proto.PageEnable{}); err != nil {
+		if derr := detach(); derr != nil {
+			err = fmt.Errorf("%w (detach of session failed: %v)", err, derr)
+		}
+		return nil, err
+	}
+
 	b.targetsLock.Lock()
 	if cached := b.loadCachedPage(targetID); cached != nil {
 		// Another caller attached this target while we were off the lock.
-		// Keep theirs, drop our duplicate session.
+		// Keep theirs, drop our duplicate session. A failed detach can't
+		// fail the call (the returned page works); the duplicate session
+		// dies with the tab at the latest.
 		b.targetsLock.Unlock()
-		detach()
+		_ = detach()
 		return cached, nil
 	}
 	b.cachePage(page)
 	b.targetsLock.Unlock()
 
-	// If we don't enable it, it will cause a lot of unexpected browser behavior.
-	// Such as proto.PageAddScriptToEvaluateOnNewDocument won't work.
-	page.Context(b.ctx).EnableDomain(&proto.PageEnable{})
-
 	return page, nil
 }
 
 // EachEvent is similar to [Page.EachEvent], but catches events of the entire browser.
-func (b *Browser) EachEvent(callbacks ...interface{}) (wait func()) {
+func (b *Browser) EachEvent(callbacks ...interface{}) (wait func() error) {
 	return b.eachEvent("", callbacks...)
 }
 
 // WaitEvent waits for the next event for one time. It will also load the data into the event object.
-func (b *Browser) WaitEvent(e proto.Event) (wait func()) {
+func (b *Browser) WaitEvent(e proto.Event) (wait func() error) {
 	return b.waitEvent("", e)
 }
 
 // waits for the next event for one time. It will also load the data into the event object.
-func (b *Browser) waitEvent(sessionID proto.TargetSessionID, e proto.Event) (wait func()) {
+func (b *Browser) waitEvent(sessionID proto.TargetSessionID, e proto.Event) (wait func() error) {
 	valE := reflect.ValueOf(e)
 	valTrue := reflect.ValueOf(true)
 
@@ -407,10 +426,23 @@ func (b *Browser) waitEvent(sessionID proto.TargetSessionID, e proto.Event) (wai
 
 // If the any callback returns true the event loop will stop.
 // It will enable the related domains if not enabled, and restore them after wait ends.
-func (b *Browser) eachEvent(sessionID proto.TargetSessionID, callbacks ...interface{}) (wait func()) {
+// The returned wait reports why it ended: nil when a callback returned true,
+// the enable error when a required domain couldn't be enabled (the event
+// could never arrive), the ctx error when the ctx died first, or
+// [ErrEventStreamClosed] when the browser connection ended. Domain restores
+// are best-effort cleanup.
+func (b *Browser) eachEvent(sessionID proto.TargetSessionID, callbacks ...interface{}) (wait func() error) {
 	cbMap := map[string]reflect.Value{}
-	restores := []func(){}
+	restores := []func() error{}
 
+	parent := b
+	b, cancel := b.WithCancel()
+	// Subscribe before enabling the domains, so events emitted while the
+	// enable is in flight can't fall in a gap (a paused Fetch request whose
+	// event is dropped stays paused forever).
+	messages := b.Event()
+
+	var enableErr error
 	for _, cb := range callbacks {
 		cbVal := reflect.ValueOf(cb)
 		eType := cbVal.Type().In(0)
@@ -423,14 +455,15 @@ func (b *Browser) eachEvent(sessionID proto.TargetSessionID, callbacks ...interf
 		domain, _ := proto.ParseMethodName(name)
 		if req := proto.GetType(domain + ".enable"); req != nil {
 			enable := reflect.New(req).Interface().(proto.Request) //nolint: forcetypeassert
-			restores = append(restores, b.EnableDomain(sessionID, enable))
+			restore, err := parent.EnableDomain(sessionID, enable)
+			if err != nil && enableErr == nil {
+				enableErr = err
+			}
+			restores = append(restores, restore)
 		}
 	}
 
-	b, cancel := b.WithCancel()
-	messages := b.Event()
-
-	return func() {
+	return func() (err error) {
 		if messages == nil {
 			panic("can't use wait function twice")
 		}
@@ -439,9 +472,17 @@ func (b *Browser) eachEvent(sessionID proto.TargetSessionID, callbacks ...interf
 			cancel()
 			messages = nil
 			for _, restore := range restores {
-				restore()
+				// A failed restore leaves the domain enabled; report it
+				// unless the wait already failed for a more primary reason.
+				if rerr := restore(); rerr != nil && err == nil {
+					err = rerr
+				}
 			}
 		}()
+
+		if enableErr != nil {
+			return enableErr
+		}
 
 		for msg := range messages {
 			if !(sessionID == "" || msg.SessionID == sessionID) {
@@ -458,11 +499,19 @@ func (b *Browser) eachEvent(sessionID proto.TargetSessionID, callbacks ...interf
 				res := cbVal.Call(args)
 				if len(res) > 0 {
 					if res[0].Bool() {
-						return
+						return nil
 					}
 				}
 			}
 		}
+
+		// The message channel closed without a callback match: the ctx died
+		// or the browser connection ended. Report it, a timed-out wait must
+		// be distinguishable from the event arriving.
+		if cerr := parent.ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return ErrEventStreamClosed
 	}
 }
 
@@ -557,15 +606,19 @@ func (b *Browser) SetCookies(cookies []*proto.NetworkCookieParam) error {
 // The file path will be:
 //
 //	filepath.Join(dir, info.GUID)
-func (b *Browser) WaitDownload(dir string) func() (info *proto.PageDownloadWillBegin) {
+func (b *Browser) WaitDownload(dir string) func() (info *proto.PageDownloadWillBegin, err error) {
 	var oldDownloadBehavior proto.BrowserSetDownloadBehavior
 	has := b.LoadState("", &oldDownloadBehavior)
 
-	_ = proto.BrowserSetDownloadBehavior{
+	if err := (proto.BrowserSetDownloadBehavior{
 		Behavior:         proto.BrowserSetDownloadBehaviorBehaviorAllowAndName,
 		BrowserContextID: b.BrowserContextID,
 		DownloadPath:     dir,
-	}.Call(b)
+	}).Call(b); err != nil {
+		// Downloads can never land in dir: fail fast instead of returning a
+		// wait that can't fire.
+		return func() (*proto.PageDownloadWillBegin, error) { return nil, err }
+	}
 
 	var start *proto.PageDownloadWillBegin
 
@@ -575,21 +628,30 @@ func (b *Browser) WaitDownload(dir string) func() (info *proto.PageDownloadWillB
 		return start != nil && start.GUID == e.GUID && e.State == proto.PageDownloadProgressStateCompleted
 	})
 
-	return func() *proto.PageDownloadWillBegin {
+	return func() (info *proto.PageDownloadWillBegin, err error) {
 		defer func() {
+			// Restore the previous download behavior; a failure means
+			// downloads keep landing in dir, so report it unless the wait
+			// already failed for a more primary reason.
+			var rerr error
 			if has {
-				_ = oldDownloadBehavior.Call(b)
+				rerr = oldDownloadBehavior.Call(b)
 			} else {
-				_ = proto.BrowserSetDownloadBehavior{
+				rerr = proto.BrowserSetDownloadBehavior{
 					Behavior:         proto.BrowserSetDownloadBehaviorBehaviorDefault,
 					BrowserContextID: b.BrowserContextID,
 				}.Call(b)
 			}
+			if rerr != nil && err == nil {
+				err = rerr
+			}
 		}()
 
-		waitProgress()
+		if err := waitProgress(); err != nil {
+			return nil, err
+		}
 
-		return start
+		return start, nil
 	}
 }
 

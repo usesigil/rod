@@ -33,7 +33,7 @@ func (p *Page) HijackRequests() *HijackRouter {
 
 // HijackRouter context.
 type HijackRouter struct {
-	run      func()
+	run      func() error
 	stop     func()
 	handlers []*hijackHandler
 	enable   *proto.FetchEnable
@@ -64,7 +64,9 @@ func (r *HijackRouter) initEvents() *HijackRouter { //nolint: gocognit
 	eventCtx, cancel := context.WithCancel(ctx)
 	r.stop = cancel
 
-	_ = r.enable.Call(r.client)
+	// Fetch.enable is deferred until Add() provides patterns: enabling with
+	// empty patterns would pause EVERY request, and any request that pauses
+	// before a handler exists hangs forever. Add() returns the enable error.
 
 	r.run = r.browser.Context(eventCtx).eachEvent(sessionID, func(e *proto.FetchRequestPaused) bool {
 		go func() {
@@ -141,6 +143,12 @@ func (r *HijackRouter) Remove(pattern string) error {
 	r.enable.Patterns = patterns
 	r.handlers = handlers
 
+	// Re-enabling with zero patterns would pause every request; with no
+	// handlers left, disable interception instead.
+	if len(patterns) == 0 {
+		return proto.FetchDisable{}.Call(r.client)
+	}
+
 	return r.enable.Call(r.client)
 }
 
@@ -181,8 +189,10 @@ func (r *HijackRouter) new(ctx context.Context, e *proto.FetchRequestPaused) *Hi
 }
 
 // Run the router, after you call it, you shouldn't add new handler to it.
-func (r *HijackRouter) Run() {
-	r.run()
+// It blocks until the router stops and reports why: nil after [HijackRouter.Stop],
+// otherwise the error that ended the event loop.
+func (r *HijackRouter) Run() error {
+	return r.run()
 }
 
 // Stop the router.
@@ -413,8 +423,8 @@ func (ctx *HijackResponse) Fail(reason proto.NetworkErrorReason) *HijackResponse
 // It will prevent the popup that requires user to input user name and password.
 // Ref: https://developer.mozilla.org/en-US/docs/Web/HTTP/Authentication
 func (b *Browser) HandleAuth(username, password string) func() error {
-	enable := b.DisableDomain("", &proto.FetchEnable{})
-	disable := b.EnableDomain("", &proto.FetchEnable{
+	restoreFetch, fetchErr := b.DisableDomain("", &proto.FetchEnable{})
+	restoreAuth, authErr := b.EnableDomain("", &proto.FetchEnable{
 		HandleAuthRequests: true,
 	})
 
@@ -426,11 +436,30 @@ func (b *Browser) HandleAuth(username, password string) func() error {
 	waitAuth := b.Context(ctx).WaitEvent(auth)
 
 	return func() (err error) {
-		defer enable()
-		defer disable()
+		defer func() {
+			// Failed restores leave Fetch interception misconfigured; report
+			// them unless the auth flow already failed for a more primary
+			// reason.
+			if rerr := restoreAuth(); rerr != nil && err == nil {
+				err = rerr
+			}
+			if rerr := restoreFetch(); rerr != nil && err == nil {
+				err = rerr
+			}
+		}()
 		defer cancel()
 
-		waitPaused()
+		if fetchErr != nil {
+			return fetchErr
+		}
+		if authErr != nil {
+			return authErr
+		}
+
+		err = waitPaused()
+		if err != nil {
+			return
+		}
 
 		err = proto.FetchContinueRequest{
 			RequestID: paused.RequestID,
@@ -439,7 +468,10 @@ func (b *Browser) HandleAuth(username, password string) func() error {
 			return
 		}
 
-		waitAuth()
+		err = waitAuth()
+		if err != nil {
+			return
+		}
 
 		err = proto.FetchContinueWithAuth{
 			RequestID: auth.RequestID,
