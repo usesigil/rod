@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/go-rod/rod/lib/defaults"
 	"github.com/go-rod/rod/lib/utils"
@@ -54,14 +55,21 @@ type Client struct {
 	pending sync.Map    // pending requests
 	event   chan *Event // events from browser
 
+	// How long a Send may straddle its caller's cancelled ctx before it's
+	// declared stuck and the connection is closed to unblock it. The
+	// connection is shared by every session, so closing it must be a last
+	// resort, not a side effect of one call's deadline.
+	sendGrace time.Duration
+
 	logger utils.Logger
 }
 
 // New creates a cdp connection, all messages from Client.Event must be received or they will block the client.
 func New() *Client {
 	return &Client{
-		event:  make(chan *Event),
-		logger: defaults.CDP,
+		event:     make(chan *Event),
+		sendGrace: time.Second,
+		logger:    defaults.CDP,
 	}
 }
 
@@ -134,11 +142,22 @@ func (cdp *Client) Call(ctx context.Context, sessionID, method string, params in
 			return nil, err
 		}
 	case <-ctx.Done():
-		// Send is still running when ctx fired. In healthy operation Send
-		// completes in microseconds; reaching this branch means Send is
-		// genuinely stuck (e.g. Chrome died without TCP noticing). Close
-		// the conn to unblock the Write; the goroutine then exits.
-		_ = cdp.ws.Close()
+		// ctx fired during the send window. This does NOT prove the Send is
+		// stuck: sendErr is buffered, so a completed Send can land here on
+		// the select's random pick, and a slow large write can straddle the
+		// deadline on a healthy connection. Drain sendErr for a grace period
+		// and only close the shared connection (unblocking the Write, which
+		// lets the goroutine exit) when the Send is provably wedged.
+		timer := time.NewTimer(cdp.sendGrace)
+		defer timer.Stop()
+		select {
+		case err := <-sendErr:
+			if err != nil {
+				return nil, err
+			}
+		case <-timer.C:
+			_ = cdp.ws.Close()
+		}
 		return nil, ctx.Err()
 	}
 

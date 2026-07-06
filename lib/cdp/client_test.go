@@ -317,6 +317,44 @@ func TestCallNoCloseOnResponseWaitTimeout(t *testing.T) {
 	close(blockRead)
 }
 
+func TestCallNoCloseWhenSendCompletesAtDeadline(t *testing.T) {
+	g := setup(t)
+
+	gotrace.CheckLeak(g, 0)
+
+	// Send completes at the same moment the ctx dies, so both select cases
+	// are ready and Go picks one at random. Whichever branch wins, a
+	// completed Send must never close the shared connection. Loop to
+	// exercise both outcomes of the random pick.
+	for i := 0; i < 30; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		release := make(chan struct{})
+		closeCalls := 0
+
+		ws := &MockWebSocket{
+			send: func([]byte) error {
+				cancel()
+				return nil
+			},
+			read: func() ([]byte, error) {
+				<-release
+				return nil, io.EOF
+			},
+			close: func() error {
+				closeCalls++
+				return nil
+			},
+		}
+
+		c := cdp.New().Start(ws)
+		_, err := c.Call(ctx, "sid", "method", 1)
+		g.True(errors.Is(err, context.Canceled))
+		g.Eq(closeCalls, 0)
+
+		close(release)
+	}
+}
+
 func TestCallCloseOnSendBlockCtxTimeout(t *testing.T) {
 	g := setup(t)
 
