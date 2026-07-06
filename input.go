@@ -1,8 +1,10 @@
 package rod
 
 import (
+	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/go-rod/rod/lib/input"
 	"github.com/go-rod/rod/lib/proto"
@@ -109,6 +111,14 @@ func (k *Keyboard) Type(keys ...input.Key) (err error) {
 		}
 		err = k.Release(key)
 		if err != nil {
+			// The key is down in the browser and the caller's ctx is likely
+			// dead; retry the release on a short detached ctx so the key
+			// isn't left held forever.
+			ctx, cancel := context.WithTimeout(k.page.browser.rootContext(), 5*time.Second)
+			if rerr := k.page.Context(ctx).Keyboard.Release(key); rerr != nil {
+				err = fmt.Errorf("%w (compensating key release failed: %v)", err, rerr)
+			}
+			cancel()
 			return
 		}
 	}
@@ -429,7 +439,18 @@ func (m *Mouse) Click(button proto.InputMouseButton, clickCount int) error {
 		return err
 	}
 
-	return m.Up(button, clickCount)
+	err = m.Up(button, clickCount)
+	if err != nil {
+		// The button is down in the browser and the caller's ctx is likely
+		// dead; retry the release on a short detached ctx, or every later
+		// move with the latched button becomes a drag.
+		ctx, cancel := context.WithTimeout(m.page.browser.rootContext(), 5*time.Second)
+		defer cancel()
+		if rerr := m.page.Context(ctx).Mouse.Up(button, clickCount); rerr != nil {
+			return fmt.Errorf("%w (compensating mouse up failed: %v)", err, rerr)
+		}
+	}
+	return err
 }
 
 // Touch presents a touch device, such as a hand with fingers, each finger is a [proto.InputTouchPoint].
