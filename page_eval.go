@@ -358,9 +358,6 @@ func (p *Page) getJSCtxID() (proto.RuntimeRemoteObjectID, error) {
 		return "", err
 	}
 
-	p.helpersLock.Lock()
-	delete(p.helpers, *p.jsCtxID)
-	p.helpersLock.Unlock()
 	id, err := p.jsCtxIDByObjectID(obj.Object.ObjectID)
 	*p.jsCtxID = id
 	return *p.jsCtxID, err
@@ -369,6 +366,11 @@ func (p *Page) getJSCtxID() (proto.RuntimeRemoteObjectID, error) {
 func (p *Page) unsetJSCtxID() {
 	p.jsCtxLock.Lock()
 	defer p.jsCtxLock.Unlock()
+
+	// The old ID is about to be lost, drop its cached helpers with it.
+	p.helpersLock.Lock()
+	delete(p.helpers, *p.jsCtxID)
+	p.helpersLock.Unlock()
 
 	*p.jsCtxID = ""
 }

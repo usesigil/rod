@@ -1147,7 +1147,7 @@ func (p *Page) initEvents() {
 			destroyed := proto.TargetTargetDestroyed{}
 
 			if (msg.Load(&detached) && detached.SessionID == p.SessionID) ||
-				(msg.Load(destroyed) && destroyed.TargetID == p.TargetID) {
+				(msg.Load(&destroyed) && destroyed.TargetID == p.TargetID) {
 				p.sessionCancel()
 				return
 			}

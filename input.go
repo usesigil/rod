@@ -47,6 +47,16 @@ func (s *keyboardState) modifiers() int {
 	return ms
 }
 
+func (s *keyboardState) modifiersWithout(key input.Key) int {
+	ms := 0
+	for pressed := range s.pressed {
+		if pressed != key {
+			ms |= pressed.Modifier()
+		}
+	}
+	return ms
+}
+
 // Press the key down.
 // To input characters that are not on the keyboard, such as Chinese or Japanese, you should
 // use method like [Page.InsertText].
@@ -55,27 +65,39 @@ func (k *Keyboard) Press(key input.Key) error {
 	k.page.browser.trySlowMotion()
 
 	k.state.Lock()
-	k.state.pressed[key] = struct{}{}
-	modifiers := k.state.modifiers()
+	modifiers := k.state.modifiers() | key.Modifier()
 	k.state.Unlock()
 
-	return key.Encode(proto.InputDispatchKeyEventTypeKeyDown, modifiers).Call(k.page)
+	err := key.Encode(proto.InputDispatchKeyEventTypeKeyDown, modifiers).Call(k.page)
+	if err != nil {
+		return err
+	}
+
+	k.state.Lock()
+	k.state.pressed[key] = struct{}{}
+	k.state.Unlock()
+	return nil
 }
 
 // Release the key.
 func (k *Keyboard) Release(key input.Key) error {
 	defer k.page.tryTrace(TraceTypeInput, "release key: "+key.Info().Code)()
 
+	// Send the keyUp even if the key isn't tracked as pressed: a failed
+	// keyUp must be retryable, or the key stays held in the browser forever.
 	k.state.Lock()
-	if _, has := k.state.pressed[key]; !has {
-		k.state.Unlock()
-		return nil
-	}
-	delete(k.state.pressed, key)
-	modifiers := k.state.modifiers()
+	modifiers := k.state.modifiersWithout(key)
 	k.state.Unlock()
 
-	return key.Encode(proto.InputDispatchKeyEventTypeKeyUp, modifiers).Call(k.page)
+	err := key.Encode(proto.InputDispatchKeyEventTypeKeyUp, modifiers).Call(k.page)
+	if err != nil {
+		return err
+	}
+
+	k.state.Lock()
+	delete(k.state.pressed, key)
+	k.state.Unlock()
+	return nil
 }
 
 // Type releases the key after the press.

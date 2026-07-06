@@ -646,7 +646,7 @@ func (el *Element) WaitEnabled() error {
 // Doc for disabled: https://developer.mozilla.org/en-US/docs/Web/HTML/Attributes/disabled
 func (el *Element) WaitWritable() error {
 	defer el.tryTrace(TraceTypeWait, "writable")()
-	return el.Wait(Eval(`() => !this.readonly`))
+	return el.Wait(Eval(`() => !this.readOnly`))
 }
 
 // WaitInvisible until the element invisible.
@@ -758,7 +758,10 @@ func (el *Element) Evaluate(opts *EvalOptions) (*proto.RuntimeRemoteObject, erro
 // Equal checks if the two elements are equal.
 func (el *Element) Equal(elm *Element) (bool, error) {
 	res, err := el.Eval(`elm => this === elm`, elm.Object)
-	return res.Value.Bool(), err
+	if err != nil {
+		return false, err
+	}
+	return res.Value.Bool(), nil
 }
 
 func (el *Element) id() proto.RuntimeRemoteObjectID {
