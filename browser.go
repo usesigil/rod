@@ -41,6 +41,12 @@ type Browser struct {
 
 	ctx context.Context
 
+	// The browser's lifetime ctx, captured at Connect. Cached pages derive
+	// their session ctx from it, NOT from the receiver's ctx, so bounding a
+	// call like b.Context(ctx).PageFromTarget(id) can't kill the cached page
+	// when ctx expires.
+	rootCtx context.Context
+
 	sleeper func() utils.Sleeper
 
 	logger utils.Logger
@@ -155,6 +161,8 @@ func (b *Browser) NoDefaultDevice() *Browser {
 // Connect to the browser and start to control it.
 // If fails to connect, try to launch a local browser, if local browser not found try to download one.
 func (b *Browser) Connect() error {
+	b.rootCtx = b.ctx
+
 	if b.client == nil {
 		u := b.controlURL
 		if u == "" {
@@ -269,16 +277,32 @@ func (b *Browser) PageFromSession(sessionID proto.TargetSessionID) *Page {
 	}
 }
 
+// rootContext returns the browser's lifetime ctx, captured at Connect,
+// falling back to the receiver's ctx when Connect wasn't used.
+func (b *Browser) rootContext() context.Context {
+	if b.rootCtx != nil {
+		return b.rootCtx
+	}
+	return b.ctx
+}
+
 // PageFromTarget gets or creates a Page instance.
+// The setup calls run on the receiver's ctx while the cached page's lifetime
+// derives from the browser's root ctx, so bounding the call with
+// b.Context(ctx).PageFromTarget(id) is safe: a timeout fails this call
+// without killing the returned page for later callers.
 func (b *Browser) PageFromTarget(targetID proto.TargetTargetID) (*Page, error) {
 	b.targetsLock.Lock()
-	defer b.targetsLock.Unlock()
-
 	page := b.loadCachedPage(targetID)
+	b.targetsLock.Unlock()
 	if page != nil {
 		return page, nil
 	}
 
+	// Attach and set up the page WITHOUT holding the browser-wide lock. A
+	// tab that accepts the attach but never answers the setup calls (e.g.
+	// discarded by Chrome's Memory Saver, it has no renderer process) must
+	// only block this call, not every future attach on the connection.
 	session, err := proto.TargetAttachToTarget{
 		TargetID: targetID,
 		Flatten:  true, // if it's not set no response will return
@@ -287,7 +311,17 @@ func (b *Browser) PageFromTarget(targetID proto.TargetTargetID) (*Page, error) {
 		return nil, err
 	}
 
-	sessionCtx, cancel := context.WithCancel(b.ctx)
+	sessionCtx, cancel := context.WithCancel(b.rootContext())
+
+	// The receiver's ctx may already be dead when cleanup runs (a timeout
+	// mid-setup is exactly when cleanup is needed), so detach on its own
+	// short ctx derived from the root ctx.
+	detach := func() {
+		cancel()
+		ctx, done := context.WithTimeout(b.rootContext(), 5*time.Second)
+		defer done()
+		_ = proto.TargetDetachFromTarget{SessionID: session.SessionID}.Call(b.Context(ctx))
+	}
 
 	page = &Page{
 		e:             b.e,
@@ -307,19 +341,32 @@ func (b *Browser) PageFromTarget(targetID proto.TargetTargetID) (*Page, error) {
 	page.newKeyboard().newMouse().newTouch()
 
 	if !b.defaultDevice.IsClear() {
-		err = page.Emulate(b.defaultDevice)
+		err = page.Context(b.ctx).Emulate(b.defaultDevice)
 		if err != nil {
+			detach()
 			return nil, err
 		}
 	}
 
-	b.cachePage(page)
-
+	// Start the event pump before the page is visible in the cache, so a
+	// concurrent cache hit never sees a page without one. If we lose the
+	// insert race below, detach's cancel stops the pump again.
 	page.initEvents()
+
+	b.targetsLock.Lock()
+	if cached := b.loadCachedPage(targetID); cached != nil {
+		// Another caller attached this target while we were off the lock.
+		// Keep theirs, drop our duplicate session.
+		b.targetsLock.Unlock()
+		detach()
+		return cached, nil
+	}
+	b.cachePage(page)
+	b.targetsLock.Unlock()
 
 	// If we don't enable it, it will cause a lot of unexpected browser behavior.
 	// Such as proto.PageAddScriptToEvaluateOnNewDocument won't work.
-	page.EnableDomain(&proto.PageEnable{})
+	page.Context(b.ctx).EnableDomain(&proto.PageEnable{})
 
 	return page, nil
 }
