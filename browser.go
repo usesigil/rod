@@ -18,7 +18,6 @@ import (
 	"github.com/go-rod/rod/lib/cdp"
 	"github.com/go-rod/rod/lib/defaults"
 	"github.com/go-rod/rod/lib/devices"
-	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/go-rod/rod/lib/utils"
 	"github.com/ysmood/goob"
@@ -160,21 +159,19 @@ func (b *Browser) NoDefaultDevice() *Browser {
 }
 
 // Connect to the browser and start to control it.
-// If fails to connect, try to launch a local browser, if local browser not found try to download one.
+// A client or control URL must be configured first with [Browser.Client] or
+// [Browser.ControlURL]; unlike upstream rod, this fork never launches or
+// downloads a browser (that path linked leakless's embedded helper
+// executable, a known antivirus trigger, into every consumer binary).
 func (b *Browser) Connect() error {
 	b.rootCtx = b.ctx
 
 	if b.client == nil {
-		u := b.controlURL
-		if u == "" {
-			var err error
-			u, err = launcher.New().Context(b.ctx).Launch()
-			if err != nil {
-				return err
-			}
+		if b.controlURL == "" {
+			return ErrNoControlURL
 		}
 
-		c, err := cdp.StartWithURL(b.ctx, u, nil)
+		c, err := cdp.StartWithURL(b.ctx, b.controlURL, nil)
 		if err != nil {
 			return err
 		}
@@ -186,7 +183,9 @@ func (b *Browser) Connect() error {
 	b.initEvents()
 
 	if b.monitor != "" {
-		launcher.Open(b.ServeMonitor(b.monitor))
+		// Served but not auto-opened in a browser; opening used lib/launcher,
+		// which this fork keeps out of the link graph (see Connect's doc).
+		b.logger.Println("rod monitor served on", b.ServeMonitor(b.monitor))
 	}
 
 	return proto.TargetSetDiscoverTargets{Discover: true}.Call(b)

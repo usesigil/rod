@@ -196,3 +196,7 @@ func (e *NoShadowRootError) Is(err error) bool { _, ok := err.(*NoShadowRootErro
 // ErrEventStreamClosed means the browser's event stream closed before the
 // expected event arrived, e.g. the CDP connection died while waiting.
 var ErrEventStreamClosed = errors.New("rod: event stream closed before the event arrived")
+
+// ErrNoControlURL is returned by [Browser.Connect] when neither a client nor
+// a control URL is configured. This fork never launches a browser itself.
+var ErrNoControlURL = errors.New("rod: no CDP client or control URL configured; this fork does not launch browsers")
