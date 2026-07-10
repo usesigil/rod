@@ -75,4 +75,48 @@ func patch(json gson.JSON) {
 	j, _ = json.Gets("domains", k("domain", "Fetch"), "commands", k("name", "fulfillRequest"), "parameters")
 	jj, _ = j.Gets(k("name", "body"))
 	jj.Del("optional")
+
+	// The repo JSON that generation reads (see getSchema) lowers the pdl
+	// "binary" type to "string". Fields with a description carry an
+	// "(Encoded as a base64 string when passed over JSON)" marker that the
+	// generator detects; fields without one are indistinguishable from real
+	// strings. This list restores those, taken from the pdl sources
+	// (third_party/blink/public/devtools_protocol/domains and v8's
+	// js_protocol.pdl).
+	for _, f := range []struct {
+		domain, section, container, list, field string
+	}{
+		{"BluetoothEmulation", "commands", "simulateCharacteristicOperationResponse", "parameters", "data"},
+		{"BluetoothEmulation", "commands", "simulateDescriptorOperationResponse", "parameters", "data"},
+		{"BluetoothEmulation", "events", "characteristicOperationReceived", "parameters", "data"},
+		{"BluetoothEmulation", "events", "descriptorOperationReceived", "parameters", "data"},
+		{"Network", "events", "directTCPSocketChunkReceived", "parameters", "data"},
+		{"Network", "events", "directTCPSocketChunkSent", "parameters", "data"},
+		{"Network", "types", "DirectUDPMessage", "properties", "data"},
+		{"Network", "types", "PostDataEntry", "properties", "bytes"},
+		{"Page", "commands", "getManifestIcons", "returns", "primaryIcon"},
+		{"SmartCardEmulation", "commands", "reportDataResult", "parameters", "data"},
+		{"SmartCardEmulation", "commands", "reportStatusResult", "parameters", "atr"},
+		{"SmartCardEmulation", "events", "controlRequested", "parameters", "data"},
+		{"SmartCardEmulation", "events", "setAttribRequested", "parameters", "data"},
+		{"SmartCardEmulation", "events", "transmitRequested", "parameters", "data"},
+		{"SmartCardEmulation", "types", "ReaderStateOut", "properties", "atr"},
+		{"Storage", "commands", "setProtectedAudienceKAnonymity", "parameters", "hashes"},
+		{"WebAuthn", "commands", "getCredential", "parameters", "credentialId"},
+		{"WebAuthn", "commands", "removeCredential", "parameters", "credentialId"},
+		{"WebAuthn", "commands", "setCredentialProperties", "parameters", "credentialId"},
+		{"WebAuthn", "events", "credentialDeleted", "parameters", "credentialId"},
+		{"WebAuthn", "types", "Credential", "properties", "credentialId"},
+	} {
+		idKey := "name"
+		if f.section == "types" {
+			idKey = "id"
+		}
+		j, _ := json.Gets("domains", k("domain", f.domain), f.section, k(idKey, f.container), f.list, k("name", f.field))
+		if items, has := j.Gets("items"); has {
+			items.Set("type", "binary")
+		} else {
+			j.Set("type", "binary")
+		}
+	}
 }

@@ -4,37 +4,46 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strings"
 
-	"github.com/go-rod/rod/lib/launcher"
 	"github.com/go-rod/rod/lib/utils"
 	"github.com/ysmood/gson"
 )
 
+// Tip-of-tree protocol definitions, generated from Chromium main by the
+// ChromeDevTools/devtools-protocol repo. Merged, these two files are the
+// same content a browser serves at /json/protocol.
+const (
+	browserProtocolURL = "https://raw.githubusercontent.com/ChromeDevTools/devtools-protocol/master/json/browser_protocol.json"
+	jsProtocolURL      = "https://raw.githubusercontent.com/ChromeDevTools/devtools-protocol/master/json/js_protocol.json"
+)
+
 func getSchema() gson.JSON {
-	l := launcher.New().Bin(launcher.NewBrowser().MustGet())
-	defer l.Kill()
+	obj := gson.New(download(browserProtocolURL))
+	js := gson.New(download(jsProtocolURL))
 
-	u := l.MustLaunch()
-	parsed, err := url.Parse(u)
-	utils.E(err)
-	parsed.Scheme = "http"
-	parsed.Path = "/json/protocol"
-
-	res, err := http.Get(parsed.String()) //nolint: noctx
-	utils.E(err)
-	defer func() { _ = res.Body.Close() }()
-
-	data, err := io.ReadAll(res.Body)
-	utils.E(err)
-
-	obj := gson.New(data)
+	domains := append(obj.Get("domains").Val().([]interface{}), js.Get("domains").Val().([]interface{})...)
+	obj.Set("domains", domains)
 
 	utils.E(utils.OutputFile("tmp/proto.json", obj.JSON("", "  ")))
 
 	return obj
+}
+
+func download(u string) []byte {
+	res, err := http.Get(u) //nolint: noctx
+	utils.E(err)
+	defer func() { _ = res.Body.Close() }()
+
+	if res.StatusCode != http.StatusOK {
+		panic("unexpected status " + res.Status + " downloading " + u)
+	}
+
+	data, err := io.ReadAll(res.Body)
+	utils.E(err)
+
+	return data
 }
 
 func mapType(n string) string {
@@ -76,6 +85,15 @@ func typeName(domain *domain, schema gson.JSON) string {
 		typeName += refName(domain.name, ref)
 	} else {
 		typeName = mapType(typeName)
+
+		// The devtools-protocol repo JSON lowers the pdl "binary" type to
+		// "string" with this marker appended to the description; a browser's
+		// /json/protocol serves the same fields as "binary". Restore []byte
+		// so the JSON codec base64-encodes and decodes them.
+		if typeName == "string" &&
+			strings.Contains(schema.Get("description").Str(), "Encoded as a base64 string when passed over JSON") {
+			typeName = "[]byte"
+		}
 	}
 
 	switch typeName {

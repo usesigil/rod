@@ -68,7 +68,8 @@ func main() {
 			testsCode += definition.formatTests()
 
 			if definition.originName != "" {
-				init += utils.S(`
+				init += utils.S(
+					`
 					"{{.name}}": reflect.TypeOf({{.type}}{}),`,
 					"name", definition.domain.name+"."+definition.originName,
 					"type", definition.name,
@@ -78,8 +79,10 @@ func main() {
 
 		utils.E(utils.OutputFile(
 			filepath.FromSlash(
-				fmt.Sprintf("lib/proto/%s.go", toSnakeCase(domain.name))),
-			code))
+				fmt.Sprintf("lib/proto/%s.go", toSnakeCase(domain.name)),
+			),
+			code,
+		))
 	}
 
 	init += `
