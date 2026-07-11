@@ -2,6 +2,8 @@
 package input
 
 import (
+	"strings"
+
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/ysmood/gson"
 )
@@ -25,12 +27,16 @@ var keyMapShifted = map[Key]KeyInfo{}
 
 var keyShiftedMap = map[Key]Key{}
 
+// keyMapByCode indexes keys by lowercased W3C code, such as "arrowup" or "keya".
+var keyMapByCode = map[string]Key{}
+
 // AddKey to KeyMap.
 func AddKey(key string, shiftedKey string, code string, keyCode int, location int) Key {
 	if len(key) == 1 {
 		r := Key(key[0])
 		if _, has := keyMap[r]; !has {
 			keyMap[r] = KeyInfo{key, code, keyCode, location}
+			keyMapByCode[strings.ToLower(code)] = r
 
 			if len(shiftedKey) == 1 {
 				rs := Key(shiftedKey[0])
@@ -43,8 +49,16 @@ func AddKey(key string, shiftedKey string, code string, keyCode int, location in
 
 	k := Key(keyCode + (location+1)*256)
 	keyMap[k] = KeyInfo{key, code, keyCode, location}
+	keyMapByCode[strings.ToLower(code)] = k
 
 	return k
+}
+
+// Lookup returns the key with the given W3C code, such as "Enter", "KeyA"
+// or "ShiftLeft". The code is matched case-insensitively.
+func Lookup(code string) (Key, bool) {
+	k, has := keyMapByCode[strings.ToLower(code)]
+	return k, has
 }
 
 // Info of the key.
@@ -116,9 +130,26 @@ func (k Key) Encode(t proto.InputDispatchKeyEventType, modifiers int) *proto.Inp
 		txt = info.Key
 	}
 
+	// macCommands is keyed Playwright style: active modifiers in
+	// Shift, Control, Alt, Meta order, then the W3C code, e.g.
+	// "Shift+Meta+ArrowUp". A bare key value would miss every chord
+	// entry and keys whose value differs from their code (Enter is "\r").
 	var cmd []string
 	if IsMac {
-		cmd = macCommands[info.Key]
+		shortcut := ""
+		if modifiers&ModifierShift != 0 {
+			shortcut += "Shift+"
+		}
+		if modifiers&ModifierControl != 0 {
+			shortcut += "Control+"
+		}
+		if modifiers&ModifierAlt != 0 {
+			shortcut += "Alt+"
+		}
+		if modifiers&ModifierMeta != 0 {
+			shortcut += "Meta+"
+		}
+		cmd = macCommands[shortcut+info.Code]
 	}
 
 	e := &proto.InputDispatchKeyEvent{

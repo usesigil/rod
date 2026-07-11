@@ -180,16 +180,34 @@ func (ka *KeyActions) Type(keys ...input.Key) *KeyActions {
 
 // Do the actions.
 func (ka *KeyActions) Do() (err error) {
+	held := map[input.Key]struct{}{}
 	for _, a := range ka.balance() {
 		switch a.Type {
 		case KeyActionPress:
 			err = ka.keyboard.Press(a.Key)
+			if err == nil {
+				held[a.Key] = struct{}{}
+			}
 		case KeyActionRelease:
 			err = ka.keyboard.Release(a.Key)
+			if err == nil {
+				delete(held, a.Key)
+			}
 		case KeyActionTypeKey:
 			err = ka.keyboard.Type(a.Key)
 		}
 		if err != nil {
+			// The caller's ctx is likely dead; release the keys this
+			// sequence still holds on a short detached ctx so they aren't
+			// left held in the browser forever (same as Keyboard.Type).
+			ctx, cancel := context.WithTimeout(ka.keyboard.page.browser.rootContext(), 5*time.Second)
+			kb := ka.keyboard.page.Context(ctx).Keyboard
+			for key := range held {
+				if rerr := kb.Release(key); rerr != nil {
+					err = fmt.Errorf("%w (compensating key release failed: %v)", err, rerr)
+				}
+			}
+			cancel()
 			return
 		}
 	}
