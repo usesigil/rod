@@ -748,47 +748,17 @@ func (p *Page) WaitEvent(e proto.Event) (wait func() error) {
 
 // WaitNavigation wait for a page lifecycle event when navigating.
 // Usually you will wait for [proto.PageLifecycleEventNameNetworkAlmostIdle].
-//
-// Only events of this page's main frame count: a same-process iframe's
-// lifecycle events (ads, consent frames) can no longer satisfy the wait.
-// Pass the LoaderID returned by [Page.NavigateWithResult] to additionally
-// pin the wait to that exact navigation. Without it, Chrome's replay of the
-// CURRENT document's lifecycle state (sent whenever lifecycle events are
-// enabled) can satisfy the wait instantly on an already-loaded page.
-func (p *Page) WaitNavigation(name proto.PageLifecycleEventName) func(loaderID ...proto.NetworkLoaderID) error {
-	var loader proto.NetworkLoaderID
+func (p *Page) WaitNavigation(name proto.PageLifecycleEventName) func() {
+	_ = proto.PageSetLifecycleEventsEnabled{Enabled: true}.Call(p)
 
-	// Subscribe before enabling lifecycle events so nothing lands in the gap.
-	// Events are buffered from here on and the predicate runs during wait's
-	// drain, by which time the caller has supplied the LoaderID.
-	waitPage, cancelWait := p.WithCancel()
-	wait := waitPage.EachEvent(func(e *proto.PageLifecycleEvent) bool {
-		if e.Name != name || e.FrameID != p.FrameID {
-			return false
-		}
-		return loader == "" || e.LoaderID == loader
+	wait := p.EachEvent(func(e *proto.PageLifecycleEvent) bool {
+		return e.Name == name
 	})
 
-	if err := (proto.PageSetLifecycleEventsEnabled{Enabled: true}).Call(p); err != nil {
-		// The event can never arrive: fail fast instead of returning a wait
-		// that burns its whole budget. Cancel to release the subscription.
-		cancelWait()
-		return func(...proto.NetworkLoaderID) error { return err }
-	}
-
-	return func(loaderID ...proto.NetworkLoaderID) error {
-		defer cancelWait()
-		if len(loaderID) > 0 {
-			loader = loaderID[0]
-		}
+	return func() {
 		defer p.tryTrace(TraceTypeWait, "navigation", name)()
-		err := wait()
-		// A failed disable leaves lifecycle events on; report it unless the
-		// wait already failed for a more primary reason.
-		if derr := (proto.PageSetLifecycleEventsEnabled{Enabled: false}).Call(p); derr != nil && err == nil {
-			err = derr
-		}
-		return err
+		wait()
+		_ = proto.PageSetLifecycleEventsEnabled{Enabled: false}.Call(p)
 	}
 }
 

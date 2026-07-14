@@ -431,8 +431,7 @@ func (p *Page) MustWaitOpen() (wait func() (newPage *Page)) {
 
 // MustWaitNavigation is similar to [Page.WaitNavigation].
 func (p *Page) MustWaitNavigation() func() {
-	wait := p.WaitNavigation(proto.PageLifecycleEventNameNetworkAlmostIdle)
-	return func() { wait() }
+	return p.WaitNavigation(proto.PageLifecycleEventNameNetworkAlmostIdle)
 }
 
 // MustWaitRequestIdle is similar to [Page.WaitRequestIdle].
